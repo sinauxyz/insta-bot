@@ -1,5 +1,6 @@
 import re
-时尚from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging  # Tambahkan impor logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from handlers.instagram_handlers import (
     handle_profile_pic, handle_stories, handle_highlights, handle_highlight_items,
@@ -7,7 +8,8 @@ from handlers.instagram_handlers import (
 )
 from utils.logging_utils import setup_logging, log_errors
 
-logger = setup_logging()
+# Gunakan tingkat DEBUG agar konsisten dengan main.py
+logger = setup_logging(logging.DEBUG)
 
 @log_errors(logger)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, config: dict):
@@ -61,13 +63,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, con
         elif query.data == 'story':
             await handle_stories(query, username, client, config, lang)
         elif query.data == 'highlights':
-            await handle_highlights(query, username, client, config, lang)
+            await handle_highlights(query, username, 0, client, config, lang)  # Tambahkan page=0 sebagai default
         elif query.data.startswith('highlights_next_'):
             next_page = int(query.data.split('_')[2])
-            await handle_highlights(query, username, client, config, lang, page=next_page)
+            await handle_highlights(query, username, next_page, client, config, lang)
         elif query.data.startswith('highlights_prev_'):
             prev_page = int(query.data.split('_')[2])
-            await handle_highlights(query, username, client, config, lang, page=prev_page)
+            await handle_highlights(query, username, prev_page, client, config, lang)
         elif query.data.startswith('highlight_'):
             highlight_id = query.data.split('_')[1]
             await handle_highlight_items(query, username, highlight_id, client, config, lang)

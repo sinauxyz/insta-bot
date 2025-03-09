@@ -1,40 +1,71 @@
 import os
 import pytz
 import time
-from typing import List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from instaloader import Profile, QueryReturnedBadRequestException
-from utils.file_utils import get_latest_file, create_temp_dir, cleanup_temp_dir
+import shutil
+import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from utils.logging_utils import logger, log_errors
 from utils.instagram_utils import InstagramClient
-from utils.logging_utils import setup_logging, log_errors
 
-logger = setup_logging()
+# Zona waktu Indonesia (WIB, UTC+7)
+WIB_TIMEZONE = pytz.timezone("Asia/Jakarta")
 
 @log_errors(logger)
 async def handle_profile_pic(query, username: str, client: InstagramClient, config: dict, lang: str):
-    logger.info(f"Handling profile picture request for {username}")
+    logger.info(f"Handling profile pic request for {username}")
     profile = client.get_profile(username)
+
     if profile.is_private and not profile.followed_by_viewer:
         logger.warning(f"Profile {username} is private and not followed")
         await query.message.reply_text(config["languages"][lang]["private_profile"])
         return
 
     hd_url = profile.profile_pic_url.replace("/s150x150/", "/s1080x1080/")
-    logger.debug(f"Fetching profile picture from URL: {hd_url}")
-    response = requests.get(hd_url, headers=client.get_random_headers(), stream=True)
-    response.raise_for_status()
+    temp_file = f"temp_{username}_{int(time.time())}.jpg"
+    try:
+        response = requests.get(hd_url, headers=client.headers, stream=True)
+        response.raise_for_status()
+        with open(temp_file, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    with tempfile.NamedTemporaryFile(delete=True, suffix='.jpg') as temp_file:
-        response.raw.decode_content = True
-        for chunk in response.iter_content(chunk_size=8192):
-            temp_file.write(chunk)
-        temp_file.seek(0)
-        logger.info(f"Sending profile picture for {username}")
-        await query.message.reply_document(
-            document=temp_file,
-            filename=f"{username}_profile.jpg",
-            caption=f"📸 Foto Profil @{username}"
-        )
+        with open(temp_file, "rb") as f:
+            await query.message.reply_photo(
+                photo=f,
+                caption=f"📷 Foto Profil @{username}",
+                read_timeout=60
+            )
+        logger.info(f"Profile pic sent for {username}")
+    except requests.RequestException as e:
+        logger.error(f"Failed to download profile pic for {username}: {str(e)}")
+        await query.message.reply_text("⚠️ Gagal mengambil foto profil")
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            logger.info(f"🗑️ File sementara {temp_file} dihapus")
+
+@log_errors(logger)
+async def handle_profile_info(query, username: str, client: InstagramClient, config: dict, lang: str):
+    logger.info(f"Handling profile info request for {username}")
+    profile = client.get_profile(username)
+
+    info_text = (
+        f"📊 Info Profil @{username}:\n"
+        f"👤 Nama: {profile.full_name}\n"
+        f"📝 Bio: {profile.biography or 'Tidak ada bio'}\n"
+        f"✅ Terverifikasi: {'Ya' if profile.is_verified else 'Tidak'}\n"
+        f"🏢 Bisnis: {'Ya' if profile.is_business_account else 'Tidak'}\n"
+        f"🔗 Followers: {profile.followers:,}\n"
+        f"👀 Following: {profile.followees:,}\n"
+        f"📌 Post: {profile.mediacount:,}"
+    )
+
+    try:
+        await query.message.reply_text(info_text)
+        logger.info(f"Profile info sent for {username}")
+    except Exception as e:
+        logger.error(f"Failed to send profile info for {username}: {str(e)}")
+        await query.message.reply_text("⚠️ Gagal mengambil info profil")
 
 @log_errors(logger)
 async def handle_stories(query, username: str, client: InstagramClient, config: dict, lang: str):
@@ -45,97 +76,83 @@ async def handle_stories(query, username: str, client: InstagramClient, config: 
         await query.message.reply_text(config["languages"][lang]["private_profile"])
         return
 
-    stories = []
-    try:
-        stories = client.get_stories([profile.userid])
-    except QueryReturnedBadRequestException as e:
-        logger.error(f"Instagram API denied access to stories for {username}: {str(e)}")
-        await query.message.reply_text(config["languages"][lang]["private_profile"])
-        return
-
+    stories = client.get_stories([profile.userid])
     if not stories:
         logger.info(f"No stories available for {username}")
         await query.message.reply_text(config["languages"][lang]["no_stories"])
         return
 
-    stories.sort(key=lambda x: x.date_utc)
-    time_zone = pytz.timezone(config["timezone"])
-    temp_dir = create_temp_dir(f"temp_{username}_")
+    temp_dir = f"temp_{username}_{int(time.time())}"
+    os.makedirs(temp_dir, exist_ok=True)
     sent_count = 0
 
     try:
+        logger.info(f"🔄 Memproses {len(stories)} story untuk @{username}")
         for story_item in stories:
-            client.download_storyitem(story_item, temp_dir)
-            latest_file = get_latest_file(temp_dir)
-            if not latest_file:
-                logger.warning(f"No valid file downloaded for story item {story_item.mediaid}")
-                continue
+            try:
+                file_path = client.download_storyitem(story_item, temp_dir)
+                file_size = os.path.getsize(file_path)
+                if file_size > config["max_file_size_mb"] * 1024 * 1024:
+                    logger.warning(f"File {file_path} exceeds size limit: {file_size} bytes")
+                    await query.message.reply_text("⚠️ File melebihi batas ukuran")
+                    os.remove(file_path)
+                    continue
 
-            file_size = os.path.getsize(latest_file)
-            if file_size > config["max_file_size_mb"] * 1024 * 1024:
-                logger.warning(f"File {latest_file} exceeds size limit: {file_size} bytes")
-                await query.message.reply_text("⚠️ File melebihi batas ukuran")
-                os.remove(latest_file)
+                # Konversi waktu UTC ke WIB (UTC+7)
+                local_time = story_item.date_utc.replace(tzinfo=pytz.utc).astimezone(WIB_TIMEZONE)
+                caption = f"{'📹' if story_item.is_video else '📸'} {local_time.strftime('%d-%m-%Y %H:%M:%S WIB')}"
+                with open(file_path, "rb") as f:
+                    logger.info(f"Sending story item {story_item.mediaid} for {username}")
+                    if story_item.is_video:
+                        await query.message.reply_video(video=f, caption=caption, read_timeout=60, write_timeout=60)
+                    else:
+                        await query.message.reply_photo(photo=f, caption=caption, read_timeout=60)
+                sent_count += 1
+                os.remove(file_path)
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"Failed to process story item {story_item.mediaid}: {str(e)}")
                 continue
-
-            local_time = story_item.date_utc.replace(tzinfo=pytz.utc).astimezone(time_zone)
-            caption = f"{'📹' if story_item.is_video else '📸'} {local_time.strftime('%d-%m-%Y %H:%M')}"
-            with open(latest_file, "rb") as f:
-                logger.info(f"Sending story item {story_item.mediaid} for {username}")
-                if story_item.is_video:
-                    await query.message.reply_video(video=f, caption=caption, read_timeout=60, write_timeout=60)
-                else:
-                    await query.message.reply_photo(photo=f, caption=caption, read_timeout=60)
-            sent_count += 1
-            os.remove(latest_file)
 
         logger.info(f"Sent {sent_count} stories for {username}")
         await query.message.reply_text(f"📤 Total {sent_count} story berhasil dikirim")
     finally:
-        cleanup_temp_dir(temp_dir)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"🗑️ Direktori {temp_dir} berhasil dibersihkan")
 
 @log_errors(logger)
-async def handle_highlights(query, username: str, client: InstagramClient, config: dict, lang: str, page: int = 0):
+async def handle_highlights(query, username: str, page: int, client: InstagramClient, config: dict, lang: str):
     logger.info(f"Handling highlights request for {username}, page {page}")
     profile = client.get_profile(username)
     highlights = client.get_highlights(profile)
 
     if not highlights:
         logger.info(f"No highlights available for {username}")
-        await query.message.reply_text("🌟 Tidak ada highlights yang tersedia")
+        await query.message.reply_text(config["languages"][lang]["no_highlights"])
         return
 
-    items_per_page = config["items_per_page"]
+    items_per_page = 10
     start_idx = page * items_per_page
     end_idx = start_idx + items_per_page
     current_highlights = highlights[start_idx:end_idx]
-    logger.debug(f"Displaying highlights {start_idx} to {end_idx} out of {len(highlights)}")
 
     keyboard = []
     for highlight in current_highlights:
         title = highlight.title[:15] + "..." if len(highlight.title) > 15 else highlight.title
         keyboard.append([
-            InlineKeyboardButton(
-                f"🌟 {title}",
-                callback_data=f"highlight_{highlight.unique_id}"
-            )
+            InlineKeyboardButton(f"🌟 {title}", callback_data=f"highlight_{highlight.unique_id}")
         ])
 
     navigation_buttons = []
     if page > 0:
-        navigation_buttons.append(
-            InlineKeyboardButton("⏪ Kembali", callback_data=f"highlights_prev_{page - 1}")
-        )
+        navigation_buttons.append(InlineKeyboardButton("⏪ Kembali", callback_data=f"highlights_prev_{page - 1}"))
     if len(highlights) > end_idx:
-        navigation_buttons.append(
-            InlineKeyboardButton("⏩ Lanjutkan", callback_data=f"highlights_next_{page + 1}")
-        )
-
+        navigation_buttons.append(InlineKeyboardButton("⏩ Lanjutkan", callback_data=f"highlights_next_{page + 1}"))
     if navigation_buttons:
         keyboard.append(navigation_buttons)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    logger.info(f"Sending highlights menu for {username}")
     await query.message.reply_text(
         f"Pilih highlight untuk @{username} (Halaman {page + 1}):",
         reply_markup=reply_markup
@@ -143,70 +160,69 @@ async def handle_highlights(query, username: str, client: InstagramClient, confi
 
 @log_errors(logger)
 async def handle_highlight_items(query, username: str, highlight_id: str, client: InstagramClient, config: dict, lang: str):
-    logger.info(f"Handling highlight items request for {username}, highlight ID {highlight_id}")
+    logger.info(f"Handling highlight items for {username}, highlight_id {highlight_id}")
     profile = client.get_profile(username)
     highlights = client.get_highlights(profile)
-
-    highlight_id_int = int(highlight_id)
-    highlight = next((h for h in highlights if h.unique_id == highlight_id_int), None)
+    highlight = next((h for h in highlights if str(h.unique_id) == highlight_id), None)
 
     if not highlight:
-        logger.warning(f"Highlight with ID {highlight_id} not found for {username}")
+        logger.warning(f"Highlight {highlight_id} not found for {username}")
         await query.message.reply_text("❌ Highlight tidak ditemukan")
         return
 
-    temp_dir = create_temp_dir(f"temp_highlight_{username}_")
-    sent_count = 0
-    time_zone = pytz.timezone(config["timezone"])
+    items = list(highlight.get_items())
+    if not items:
+        logger.info(f"No items in highlight {highlight_id} for {username}")
+        await query.message.reply_text("📭 Tidak ada item di highlight ini")
+        return
 
-    highlight_items = list(highlight.get_items())
-    logger.info(f"Processing {len(highlight_items)} items from highlight '{highlight.title}'")
-    await query.message.reply_text(f"🔄 Memproses {len(highlight_items)} item dari highlight '{highlight.title}'")
+    temp_dir = f"temp_highlight_{username}_{int(time.time())}"
+    os.makedirs(temp_dir, exist_ok=True)
+    sent_count = 0
 
     try:
-        for idx, item in enumerate(highlight_items, start=1):
-            client.download_storyitem(item, temp_dir)
-            latest_file = get_latest_file(temp_dir)
-            if not latest_file:
-                logger.warning(f"No valid file downloaded for highlight item {item.mediaid}")
+        logger.info(f"🔄 Memproses {len(items)} item dari highlight '{highlight.title}'")
+        for idx, item in enumerate(items, start=1):
+            try:
+                file_path = client.download_storyitem(item, temp_dir)
+                file_size = os.path.getsize(file_path)
+                if file_size > config["max_file_size_mb"] * 1024 * 1024:
+                    logger.warning(f"File {file_path} exceeds size limit: {file_size} bytes")
+                    await query.message.reply_text("⚠️ File melebihi batas ukuran")
+                    os.remove(file_path)
+                    continue
+
+                # Konversi waktu UTC ke WIB (UTC+7)
+                local_time = item.date_utc.replace(tzinfo=pytz.utc).astimezone(WIB_TIMEZONE)
+                # Gunakan tag HTML <b> untuk teks tebal
+                caption = f"<b>[{idx}].</b>🌟 {highlight.title} - {'📹' if item.is_video else '📸'} {local_time.strftime('%d-%m-%Y %H:%M:%S WIB')}"
+                with open(file_path, "rb") as f:
+                    logger.info(f"Sending highlight item {item.mediaid} for {username}")
+                    if item.is_video:
+                        await query.message.reply_video(
+                            video=f,
+                            caption=caption,
+                            parse_mode="HTML",  # Aktifkan parsing HTML
+                            read_timeout=60,
+                            write_timeout=60
+                        )
+                    else:
+                        await query.message.reply_photo(
+                            photo=f,
+                            caption=caption,
+                            parse_mode="HTML",  # Aktifkan parsing HTML
+                            read_timeout=60
+                        )
+                sent_count += 1
+                os.remove(file_path)
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Failed to process highlight item {item.mediaid}: {str(e)}")
                 continue
 
-            file_size = os.path.getsize(latest_file)
-            if file_size > config["max_file_size_mb"] * 1024 * 1024:
-                logger.warning(f"File {latest_file} exceeds size limit: {file_size} bytes")
-                await query.message.reply_text("⚠️ File melebihi batas ukuran")
-                os.remove(latest_file)
-                continue
-
-            local_time = item.date_utc.replace(tzinfo=pytz.utc).astimezone(time_zone)
-            caption = f"**[{idx}]**.🌟 {highlight.title} - {'📹' if item.is_video else '📸'} {local_time.strftime('%d-%m-%Y %H:%M')}"
-            with open(latest_file, "rb") as f:
-                logger.info(f"Sending highlight item {item.mediaid} for {username}")
-                if item.is_video:
-                    await query.message.reply_video(video=f, caption=caption, read_timeout=60, write_timeout=60)
-                else:
-                    await query.message.reply_photo(photo=f, caption=caption, read_timeout=60)
-            sent_count += 1
-            os.remove(latest_file)
-
-        logger.info(f"Sent {sent_count} items from highlight '{highlight.title}'")
+        logger.info(f"Sent {sent_count} items for highlight {highlight_id}")
         await query.message.reply_text(f"✅ {sent_count} item dari highlight '{highlight.title}' berhasil dikirim")
     finally:
-        cleanup_temp_dir(temp_dir)
-
-@log_errors(logger)
-async def handle_profile_info(query, username: str, client: InstagramClient, config: dict, lang: str):
-    logger.info(f"Handling profile info request for {username}")
-    profile = client.get_profile(username)
-    info_text = (
-        f"📊 Info Profil @{username}:\n"
-        f"👤 Nama: {profile.full_name}\n"
-        f"📝 Bio: {profile.biography}\n"
-        f"✅ Terverifikasi: {'Ya' if profile.is_verified else 'Tidak'}\n"
-        f"🏢 Bisnis: {'Ya' if profile.is_business_account else 'Tidak'}\n"
-        f"🔗 Followers: {profile.followers:,}\n"
-        f"👀 Following: {profile.followees:,}\n"
-        f"📌 Post: {profile.mediacount:,}"
-    )
-    logger.info(f"Sending profile info for {username}")
-    await query.message.reply_text(info_text)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.info(f"🗑️ Direktori {temp_dir} berhasil dibersihkan")
