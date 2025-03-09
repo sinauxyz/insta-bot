@@ -1,5 +1,5 @@
 import re
-import logging  # Tambahkan impor logging
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from handlers.instagram_handlers import (
@@ -8,20 +8,31 @@ from handlers.instagram_handlers import (
 )
 from utils.logging_utils import setup_logging, log_errors
 
-# Gunakan tingkat DEBUG agar konsisten dengan main.py
 logger = setup_logging(logging.DEBUG)
 
 @log_errors(logger)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, config: dict):
+    if not update.message or not update.effective_user:
+        logger.warning("Received update without message or user in start handler")
+        return
     lang = update.effective_user.language_code or config["default_language"]
     logger.info(f"Sending start message to user {update.effective_user.id}")
     await update.message.reply_text(config["languages"][lang]["start"])
 
 @log_errors(logger)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, config: dict, client):
-    lang = update.effective_user.language_code or config["default_language"]
+    # Periksa apakah update memiliki message dan effective_user
+    if not update.message:
+        logger.warning(f"Received update without message: {update}")
+        return
+    if not update.effective_user:
+        logger.warning(f"Received update without effective_user: {update}")
+        lang = config["default_language"]  # Fallback ke default jika user tidak ada
+    else:
+        lang = update.effective_user.language_code or config["default_language"]
+
     url = update.message.text.strip()
-    logger.info(f"Received message from user {update.effective_user.id}: {url}")
+    logger.info(f"Received message from user {update.effective_user.id if update.effective_user else 'unknown'}: {url}")
     username = extract_username(url)
 
     if not username:
@@ -47,10 +58,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, con
 @log_errors(logger)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, config: dict, client):
     query = update.callback_query
+    if not query:
+        logger.warning("Received update without callback_query")
+        return
     await query.answer()
     logger.info(f"Received callback query: {query.data} from user {query.from_user.id}")
 
-    lang = update.effective_user.language_code or config["default_language"]
+    lang = update.effective_user.language_code or config["default_language"] if update.effective_user else config["default_language"]
     username = context.user_data.get('current_profile')
     if not username:
         logger.warning("Session expired, no current_profile found")

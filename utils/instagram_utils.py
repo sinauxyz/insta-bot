@@ -130,7 +130,7 @@ class InstagramClient:
         logger.debug(f"Applying human-like delay of {delay:.2f} seconds")
         time.sleep(delay)
         if self.request_count % random.randint(5, 10) == 0:
-            long_delay = random.uniform(15, 30)
+            long_delay = random.uniform(30, 60)
             logger.info(f"Simulating long pause of {long_delay:.2f} seconds")
             time.sleep(long_delay)
         if random.random() < 0.2:
